@@ -1,14 +1,49 @@
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { EntityType, Role } from "@/generated/prisma/client";
+// Mock the chat-provider seam only for `generateSessionRecap` (mirrors
+// ask.test.ts) — everything else in this file runs against the real Postgres
+// service layer.
+const { resolveCampaignProvider } = vi.hoisted(() => ({
+  resolveCampaignProvider: vi.fn(),
+}));
+
+vi.mock("@/server/ai", async (importActual) => {
+  const actual = await importActual<typeof import("@/server/ai")>();
+  return { ...actual, resolveCampaignProvider };
+});
+
+import { CanonStatus, EntityType, Role } from "@/generated/prisma/client";
+import { ServiceError } from "@/lib/errors";
 import { prisma } from "@/server/db";
 import { createCampaign } from "@/server/services/campaigns";
 import {
   addSessionLogEntry,
   createSession,
+  generateSessionRecap,
   getSession,
   listSessions,
+  promoteSessionLogEntryToEvent,
+  publishSessionRecap,
 } from "@/server/services/sessions";
+
+const SAMPLE_USAGE = {
+  inputTokens: 1000,
+  outputTokens: 200,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+};
+
+function fakeProvider(text: string, over: { id?: string; model?: string } = {}) {
+  const model = over.model ?? "claude-opus-4-8";
+  const providerId = over.id ?? "anthropic";
+  return {
+    id: providerId,
+    model,
+    generate: vi.fn().mockResolvedValue({ text, usage: SAMPLE_USAGE, model, providerId }),
+    generateStructured: vi.fn(),
+    embed: vi.fn(),
+  };
+}
 
 // Service-layer tests against a real Postgres (see campaigns.test.ts). Sessions
 // and their log entries are scratch, not canon, so they're created by a direct
@@ -29,6 +64,8 @@ function makeEntity(campaignId: string, name: string) {
 }
 
 beforeEach(async () => {
+  resolveCampaignProvider.mockReset();
+  await prisma.aiUsage.deleteMany();
   await prisma.sessionLogEntry.deleteMany();
   await prisma.gameSession.deleteMany();
   await prisma.membership.deleteMany();
@@ -183,5 +220,314 @@ describe("addSessionLogEntry + getSession", () => {
     const owner = await makeUser("dm@log5.test");
     const campaign = await createCampaign(owner.id, { name: "Log" });
     expect(await getSession(owner.id, campaign.id, "nope")).toBeNull();
+  });
+});
+
+describe("promoteSessionLogEntryToEvent", () => {
+  it("creates a canonical Event from the entry's text, with tagged live entities as ACTOR participants", async () => {
+    const owner = await makeUser("dm@promote.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const npc = await makeEntity(campaign.id, "Carl");
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, {
+      text: "Carl insulted the Maestro on air",
+      taggedIds: [npc.id],
+    });
+
+    const result = await promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+      title: "Maestro incident",
+    });
+
+    const event = await prisma.event.findUniqueOrThrow({
+      where: { id: result.id },
+      include: { participants: true },
+    });
+    expect(event.title).toBe("Maestro incident");
+    expect(event.summary).toBe("Carl insulted the Maestro on air");
+    expect(event.status).toBe(CanonStatus.CANON);
+    expect(event.source).toBe("DM");
+    expect(event.participants).toHaveLength(1);
+    expect(event.participants[0]).toMatchObject({ entityId: npc.id, role: "ACTOR" });
+
+    const updatedEntry = await prisma.sessionLogEntry.findUniqueOrThrow({ where: { id: entry.id } });
+    expect(updatedEntry.promotedEventId).toBe(result.id);
+  });
+
+  it("creates an Event with no participants when the entry has no tags", async () => {
+    const owner = await makeUser("dm@promote2.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, {
+      text: "A quiet moment",
+    });
+
+    const result = await promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+      title: "Quiet moment",
+    });
+
+    const event = await prisma.event.findUniqueOrThrow({
+      where: { id: result.id },
+      include: { participants: true },
+    });
+    expect(event.participants).toHaveLength(0);
+  });
+
+  it("drops a tagged entity that is no longer live canon", async () => {
+    const owner = await makeUser("dm@promote3.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const npc = await makeEntity(campaign.id, "Carl");
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, {
+      text: "Carl vanishes",
+      taggedIds: [npc.id],
+    });
+    await prisma.entity.update({ where: { id: npc.id }, data: { status: CanonStatus.ARCHIVED } });
+
+    const result = await promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+      title: "Disappearance",
+    });
+
+    const event = await prisma.event.findUniqueOrThrow({
+      where: { id: result.id },
+      include: { participants: true },
+    });
+    expect(event.participants).toHaveLength(0);
+  });
+
+  it("rejects promoting an entry that has already been promoted", async () => {
+    const owner = await makeUser("dm@promote4.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+    await promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+      title: "First",
+    });
+
+    await expect(
+      promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+        title: "Again",
+      }),
+    ).rejects.toThrow("This entry has already been promoted to an event.");
+  });
+
+  it("rejects an empty title", async () => {
+    const owner = await makeUser("dm@promote5.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+
+    await expect(
+      promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, { title: "   " }),
+    ).rejects.toThrow("Event title is required.");
+  });
+
+  it("rejects an unknown entry id", async () => {
+    const owner = await makeUser("dm@promote6.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+
+    await expect(
+      promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, "nope", { title: "T" }),
+    ).rejects.toThrow("Log entry not found.");
+  });
+
+  it("rejects a player caller", async () => {
+    const owner = await makeUser("dm@promote7.test");
+    const player = await makeUser("player@promote7.test");
+    const campaign = await createCampaign(owner.id, { name: "Promote" });
+    await addPlayer(player.id, campaign.id);
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+
+    await expect(
+      promoteSessionLogEntryToEvent(player.id, campaign.id, session.id, entry.id, { title: "T" }),
+    ).rejects.toThrow("You do not have permission to edit this campaign.");
+  });
+});
+
+describe("generateSessionRecap", () => {
+  it("generates a recap from the log and records usage", async () => {
+    const owner = await makeUser("dm@recap.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "Session 1" });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Donut insulted the Maestro" });
+
+    const provider = fakeProvider("Previously on Dungeon Crawler World: chaos ensued.");
+    resolveCampaignProvider.mockResolvedValue(provider);
+
+    const result = await generateSessionRecap(owner.id, campaign.id, session.id);
+
+    expect(result.recap).toBe("Previously on Dungeon Crawler World: chaos ensued.");
+    expect(result.model).toBe("claude-opus-4-8");
+
+    const userMsg = provider.generate.mock.calls[0][0].messages[0].content;
+    expect(userMsg).toContain("Donut insulted the Maestro");
+
+    const usage = await prisma.aiUsage.findMany({
+      where: { campaignId: campaign.id, generatorId: "session-recap" },
+    });
+    expect(usage).toHaveLength(1);
+    expect(usage[0].outputTokens).toBe(SAMPLE_USAGE.outputTokens);
+  });
+
+  it("includes promoted events (with participants) as context alongside the raw log", async () => {
+    const owner = await makeUser("dm@recap2.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "Session 1" });
+    const npc = await makeEntity(campaign.id, "Carl");
+    const entry = await addSessionLogEntry(owner.id, campaign.id, session.id, {
+      text: "Carl insulted the Maestro on air",
+      taggedIds: [npc.id],
+    });
+    await promoteSessionLogEntryToEvent(owner.id, campaign.id, session.id, entry.id, {
+      title: "Maestro incident",
+    });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "A quiet aftermath" });
+
+    const provider = fakeProvider("Recap text.");
+    resolveCampaignProvider.mockResolvedValue(provider);
+
+    await generateSessionRecap(owner.id, campaign.id, session.id);
+
+    const userMsg = provider.generate.mock.calls[0][0].messages[0].content;
+    expect(userMsg).toContain("Maestro incident");
+    expect(userMsg).toContain("Carl");
+    expect(userMsg).toContain("A quiet aftermath");
+  });
+
+  it("rejects a session with no log entries", async () => {
+    const owner = await makeUser("dm@recap3.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "Empty" });
+
+    await expect(generateSessionRecap(owner.id, campaign.id, session.id)).rejects.toThrow(
+      "Add a log entry before generating a recap.",
+    );
+  });
+
+  it("rejects an unknown session id", async () => {
+    const owner = await makeUser("dm@recap4.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+
+    await expect(generateSessionRecap(owner.id, campaign.id, "nope")).rejects.toThrow(
+      "Session not found.",
+    );
+  });
+
+  it("rejects a player caller", async () => {
+    const owner = await makeUser("dm@recap5.test");
+    const player = await makeUser("player@recap5.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    await addPlayer(player.id, campaign.id);
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+
+    await expect(generateSessionRecap(player.id, campaign.id, session.id)).rejects.toThrow(
+      "You do not have permission to edit this campaign.",
+    );
+  });
+
+  it("throws a safe error when no provider is configured", async () => {
+    const owner = await makeUser("dm@recap6.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+    resolveCampaignProvider.mockResolvedValue(null);
+
+    await expect(generateSessionRecap(owner.id, campaign.id, session.id)).rejects.toThrow(
+      ServiceError,
+    );
+  });
+
+  it("turns a provider failure into a safe ServiceError (invariant #6)", async () => {
+    const owner = await makeUser("dm@recap7.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+    const provider = fakeProvider("unused");
+    provider.generate.mockRejectedValue({ status: 401, message: "x-api-key: sk-leak" });
+    resolveCampaignProvider.mockResolvedValue(provider);
+
+    await expect(generateSessionRecap(owner.id, campaign.id, session.id)).rejects.toThrow(
+      ServiceError,
+    );
+    await expect(generateSessionRecap(owner.id, campaign.id, session.id)).rejects.not.toThrow(
+      /sk-leak/,
+    );
+  });
+
+  it("rejects when the model returns an empty recap", async () => {
+    const owner = await makeUser("dm@recap8.test");
+    const campaign = await createCampaign(owner.id, { name: "Recap" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+    await addSessionLogEntry(owner.id, campaign.id, session.id, { text: "Once" });
+    resolveCampaignProvider.mockResolvedValue(fakeProvider("   "));
+
+    await expect(generateSessionRecap(owner.id, campaign.id, session.id)).rejects.toThrow(
+      "The model did not return a usable recap.",
+    );
+  });
+});
+
+describe("publishSessionRecap", () => {
+  it("creates a player-visible SYSTEM_MESSAGE from the recap text, source DM", async () => {
+    const owner = await makeUser("dm@publish.test");
+    const campaign = await createCampaign(owner.id, { name: "Publish" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+
+    const result = await publishSessionRecap(owner.id, campaign.id, session.id, {
+      title: "Previously on Dungeon Crawler World: Session 1",
+      recap: "Donut insulted the Maestro live on air.",
+    });
+
+    const entity = await prisma.entity.findUniqueOrThrow({ where: { id: result.id } });
+    expect(entity.type).toBe(EntityType.SYSTEM_MESSAGE);
+    expect(entity.name).toBe("Previously on Dungeon Crawler World: Session 1");
+    expect(entity.description).toBe("Donut insulted the Maestro live on air.");
+    expect(entity.visibility).toBe("PLAYER_VISIBLE");
+    expect(entity.status).toBe(CanonStatus.CANON);
+    expect(entity.source).toBe("DM");
+    expect(entity.tags).toEqual(["recap"]);
+  });
+
+  it("rejects a blank title", async () => {
+    const owner = await makeUser("dm@publish2.test");
+    const campaign = await createCampaign(owner.id, { name: "Publish" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+
+    await expect(
+      publishSessionRecap(owner.id, campaign.id, session.id, { title: "   ", recap: "Text" }),
+    ).rejects.toThrow("Recap title is required.");
+  });
+
+  it("rejects blank recap text", async () => {
+    const owner = await makeUser("dm@publish3.test");
+    const campaign = await createCampaign(owner.id, { name: "Publish" });
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+
+    await expect(
+      publishSessionRecap(owner.id, campaign.id, session.id, { title: "T", recap: "   " }),
+    ).rejects.toThrow("Recap text is required.");
+  });
+
+  it("rejects an unknown session", async () => {
+    const owner = await makeUser("dm@publish4.test");
+    const campaign = await createCampaign(owner.id, { name: "Publish" });
+
+    await expect(
+      publishSessionRecap(owner.id, campaign.id, "nope", { title: "T", recap: "Text" }),
+    ).rejects.toThrow("Session not found.");
+  });
+
+  it("rejects a player caller", async () => {
+    const owner = await makeUser("dm@publish5.test");
+    const player = await makeUser("player@publish5.test");
+    const campaign = await createCampaign(owner.id, { name: "Publish" });
+    await addPlayer(player.id, campaign.id);
+    const session = await createSession(owner.id, campaign.id, { title: "S" });
+
+    await expect(
+      publishSessionRecap(player.id, campaign.id, session.id, { title: "T", recap: "Text" }),
+    ).rejects.toThrow("You do not have permission to edit this campaign.");
   });
 });

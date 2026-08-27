@@ -1,15 +1,32 @@
-import { Role } from "@/generated/prisma/client";
+import { CanonStatus, EntityType, OpKind, Role } from "@/generated/prisma/client";
 import { ServiceError } from "@/lib/errors";
 import { prisma } from "@/server/db";
+import { describeProviderError, resolveCampaignProvider } from "@/server/ai";
+import { ProviderError, type LLMUsage } from "@/server/ai/types";
+import {
+  SESSION_RECAP_GENERATOR,
+  SESSION_RECAP_MAX_TOKENS,
+  buildSessionRecapPrompt,
+  type SessionRecapLogEntry,
+  type SessionRecapPromotedEvent,
+} from "@/server/ai/generators/session-recap";
+import { logActionError } from "@/server/log";
+import { assertWithinSpendCap, recordAiUsage } from "@/server/services/ai-usage";
+import { buildBroadcastCreatePatch } from "@/server/services/entities";
+import { createEvent } from "@/server/services/events";
+import { applyAutoApprovedEntityChangeSet } from "@/server/services/review";
 
 // Live session capture (M8 slice 1 — docs/08-session-mode.md). A `GameSession`
 // (renamed from docs' `Session` to avoid colliding with NextAuth's own Session
 // model) is the DM's play-session log: title, date, floor/area focus, prep
 // notes, and a running `SessionLogEntry` capture log. Both are scratch, not
 // canon — created by a direct DM mutation, not the review pipeline (invariant
-// #1 is about canon writes; this isn't one), mirroring knowledge.ts. Promoting
-// a log entry to a canonical Event is a later M8 slice (`promotedEventId`
-// stays null until then).
+// #1 is about canon writes; this isn't one), mirroring knowledge.ts.
+//
+// Promoting a log entry to a canonical Event (M8 slice 2) *does* route through
+// the review pipeline — via `createEvent`'s existing auto-approved DM change
+// set — so the promoted Event carries full provenance even though the log
+// entry it came from doesn't.
 
 async function getMembership(userId: string, campaignId: string) {
   return prisma.membership.findUnique({
@@ -200,4 +217,252 @@ export async function addSessionLogEntry(
     data: { sessionId, text, taggedIds },
     select: { id: true },
   });
+}
+
+/**
+ * Promote a log entry to a canonical Event through the normal review pipeline
+ * (docs/08: "source: DM, auto-approved but fully provenanced"). The DM
+ * supplies only a title; the entry's own text becomes the event's summary and
+ * its still-live tagged entities become ACTOR participants, so the low-
+ * friction capture flow stays low-friction on the way to canon too. Causal
+ * links and effects aren't set here — the DM adds those afterward from the
+ * Timeline like any other event. An already-promoted entry can't be promoted
+ * again (`promotedEventId` is a one-way pointer).
+ */
+export async function promoteSessionLogEntryToEvent(
+  userId: string,
+  campaignId: string,
+  sessionId: string,
+  entryId: string,
+  input: { title: string },
+): Promise<{ id: string }> {
+  await assertCampaignDm(userId, campaignId);
+
+  const title = input.title.trim();
+  if (!title) throw new ServiceError("Event title is required.");
+
+  const entry = await prisma.sessionLogEntry.findFirst({
+    where: { id: entryId, sessionId, session: { campaignId } },
+    select: { id: true, text: true, taggedIds: true, promotedEventId: true },
+  });
+  if (!entry) throw new ServiceError("Log entry not found.");
+  if (entry.promotedEventId) {
+    throw new ServiceError("This entry has already been promoted to an event.");
+  }
+
+  let participants: { entityId: string; role: "ACTOR" }[] = [];
+  if (entry.taggedIds.length > 0) {
+    const live = await prisma.entity.findMany({
+      where: { id: { in: entry.taggedIds }, campaignId, status: CanonStatus.CANON },
+      select: { id: true },
+    });
+    participants = live.map((live) => ({ entityId: live.id, role: "ACTOR" as const }));
+  }
+
+  const event = await createEvent(userId, campaignId, {
+    title,
+    summary: entry.text,
+    secret: false,
+    participants,
+  });
+
+  await prisma.sessionLogEntry.update({
+    where: { id: entryId },
+    data: { promotedEventId: event.id },
+  });
+
+  return { id: event.id };
+}
+
+export type SessionRecapResult = {
+  recap: string;
+  model: string;
+  providerId: string;
+};
+
+/**
+ * Generate a "previously on Dungeon Crawler World" recap for one session, from
+ * its raw log entries plus the events it promoted to canon
+ * (docs/08-session-mode.md "Session recap"). Read-only synthesis, like "Ask"
+ * (`ask.ts`) — never writes canon (invariant #1) and is never persisted; the DM
+ * regenerates on demand. Publishing the result is a separate step — see
+ * `publishSessionRecap` below. Persona voice and per-crawler spotlights stay
+ * later M8 follow-ups. DM-only.
+ * Throws a `ServiceError` (safe message — invariant #6) for a non-DM caller, an
+ * unknown session, an empty session, no configured provider, a reached spend
+ * cap, or a provider failure.
+ */
+export async function generateSessionRecap(
+  userId: string,
+  campaignId: string,
+  sessionId: string,
+): Promise<SessionRecapResult> {
+  await assertCampaignDm(userId, campaignId);
+
+  const [campaign, session] = await Promise.all([
+    prisma.campaign.findUnique({
+      where: { id: campaignId },
+      select: { name: true, styleGuide: true },
+    }),
+    prisma.gameSession.findFirst({
+      where: { id: sessionId, campaignId },
+      select: {
+        title: true,
+        playedAt: true,
+        focus: true,
+        entries: {
+          orderBy: { at: "asc" },
+          select: { text: true, taggedIds: true, promotedEventId: true },
+        },
+      },
+    }),
+  ]);
+  if (!campaign) throw new ServiceError("Campaign not found.");
+  if (!session) throw new ServiceError("Session not found.");
+  if (session.entries.length === 0) {
+    throw new ServiceError("Add a log entry before generating a recap.");
+  }
+
+  const byId = await resolveTaggedEntities(campaignId, session.entries);
+  const entries: SessionRecapLogEntry[] = session.entries.map((entry) => ({
+    text: entry.text,
+    taggedNames: entry.taggedIds
+      .map((id) => byId.get(id)?.name)
+      .filter((name): name is string => Boolean(name)),
+  }));
+
+  const promotedEventIds = session.entries
+    .map((entry) => entry.promotedEventId)
+    .filter((id): id is string => Boolean(id));
+  const eventRows =
+    promotedEventIds.length === 0
+      ? []
+      : await prisma.event.findMany({
+          where: { id: { in: promotedEventIds }, campaignId, status: CanonStatus.CANON },
+          select: {
+            title: true,
+            summary: true,
+            participants: { select: { entity: { select: { name: true } } } },
+          },
+        });
+  const promotedEvents: SessionRecapPromotedEvent[] = eventRows.map((event) => ({
+    title: event.title,
+    summary: event.summary,
+    participantNames: event.participants.map((p) => p.entity.name),
+  }));
+
+  const provider = await resolveCampaignProvider(campaignId);
+  if (!provider) {
+    throw new ServiceError("Add an AI provider key in Settings to generate a session recap.");
+  }
+
+  await assertWithinSpendCap(campaignId);
+
+  const { system, messages } = buildSessionRecapPrompt({
+    campaignName: campaign.name,
+    styleGuide: campaign.styleGuide,
+    sessionTitle: session.title,
+    playedAt: session.playedAt ? session.playedAt.toISOString().slice(0, 10) : null,
+    focus: session.focus,
+    entries,
+    promotedEvents,
+  });
+
+  let recap: string;
+  let usage: LLMUsage;
+  let usageModel: string;
+  let usageProviderId: string;
+  try {
+    const result = await provider.generate({
+      system,
+      messages,
+      maxTokens: SESSION_RECAP_MAX_TOKENS,
+    });
+    recap = result.text.trim();
+    usage = result.usage;
+    usageModel = result.model;
+    usageProviderId = result.providerId;
+  } catch (error) {
+    logActionError(
+      `Session-recap generation failed (provider=${provider.id})`,
+      error,
+      provider.redactSecrets,
+    );
+    const message = error instanceof ProviderError ? error.message : describeProviderError(error);
+    throw new ServiceError(message);
+  }
+
+  if (!recap) {
+    throw new ServiceError("The model did not return a usable recap.");
+  }
+
+  // Best-effort: never lose a paid recap over a usage-tracking write (mirrors askCampaign).
+  try {
+    await recordAiUsage({
+      campaignId,
+      userId,
+      providerId: usageProviderId,
+      model: usageModel,
+      generatorId: SESSION_RECAP_GENERATOR.id,
+      usage,
+    });
+  } catch {
+    // usage tracking is non-critical
+  }
+
+  return { recap, model: usageModel, providerId: usageProviderId };
+}
+
+export type PublishSessionRecapResult = { id: string };
+
+/**
+ * Publish an already-generated session recap to players as a `SYSTEM_MESSAGE`
+ * entity (docs/08-session-mode.md "Recaps & broadcasts": recaps "can [be]
+ * ephemeral, publish[ed] to players … as a SYSTEM_MESSAGE/Show artifact via
+ * the review pipeline, or both"). Unlike `generateSessionRecap` this *does*
+ * write canon — an auto-approved DM `CREATE_ENTITY` change set (source: DM,
+ * fully provenanced), the same direct-write shape `promoteSessionLogEntryToEvent`
+ * uses. The recap text is carried from the client exactly as displayed, never
+ * regenerated here: a DM can already create any entity with any content
+ * through the ordinary create-entity form, so trusting DM-submitted text isn't
+ * a new privilege. Created `PLAYER_VISIBLE` immediately (via
+ * `buildBroadcastCreatePatch`) — publishing *is* the deliberate reveal, not a
+ * proposal to review further. DM-only; rejects a blank title/recap or an
+ * unknown session.
+ */
+export async function publishSessionRecap(
+  userId: string,
+  campaignId: string,
+  sessionId: string,
+  input: { title: string; recap: string },
+): Promise<PublishSessionRecapResult> {
+  await assertCampaignDm(userId, campaignId);
+
+  const title = input.title.trim();
+  if (!title) throw new ServiceError("Recap title is required.");
+  const recap = input.recap.trim();
+  if (!recap) throw new ServiceError("Recap text is required.");
+
+  const session = await prisma.gameSession.findFirst({
+    where: { id: sessionId, campaignId },
+    select: { id: true },
+  });
+  if (!session) throw new ServiceError("Session not found.");
+
+  const result = await applyAutoApprovedEntityChangeSet(userId, campaignId, {
+    title: `Publish recap: ${title}`,
+    operations: [
+      {
+        op: OpKind.CREATE_ENTITY,
+        patch: buildBroadcastCreatePatch(userId, campaignId, {
+          type: EntityType.SYSTEM_MESSAGE,
+          name: title,
+          description: recap,
+          tags: ["recap"],
+        }),
+      },
+    ],
+  });
+
+  return { id: result.targetIds[0] };
 }

@@ -22,7 +22,11 @@ import {
   eventParticipantRoleValues,
   grantKnowledgeSchema,
   lockFieldSchema,
+  promoteSessionLogEntrySchema,
+  publishSessionRecapSchema,
+  revealEntityBroadlySchema,
   reviewEditValueKindSchema,
+  sessionRevealSchema,
   updateEntitySchema,
   updateEventSchema,
   updateRelationshipSchema,
@@ -60,15 +64,20 @@ import {
   createGenericEntity,
   getEntityForUser,
   restoreEntity,
+  revealEntityBroadly,
   updateEntity,
 } from "@/server/services/entities";
 import {
   grantEntityKnowledge,
+  grantMembershipKnowledge,
   revokeKnowledge,
 } from "@/server/services/knowledge";
 import {
   addSessionLogEntry,
   createSession,
+  generateSessionRecap,
+  promoteSessionLogEntryToEvent,
+  publishSessionRecap,
 } from "@/server/services/sessions";
 import {
   fleshOutEntities,
@@ -1376,6 +1385,195 @@ export async function addSessionLogEntryAction(
 
   revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
   return undefined;
+}
+
+export type PromoteSessionLogEntryActionState = { error?: string } | undefined;
+
+export async function promoteSessionLogEntryAction(
+  campaignId: string,
+  sessionId: string,
+  entryId: string,
+  _prev: PromoteSessionLogEntryActionState,
+  formData: FormData,
+): Promise<PromoteSessionLogEntryActionState> {
+  const user = await requireUser();
+  const parsed = promoteSessionLogEntrySchema.safeParse({
+    title: formData.get("title"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  try {
+    await promoteSessionLogEntryToEvent(user.id, campaignId, sessionId, entryId, parsed.data);
+  } catch (error) {
+    if (error instanceof ServiceError) return { error: error.message };
+    logActionError("Promote session log entry action failed", error);
+    return { error: "Could not promote this entry. Please try again." };
+  }
+
+  revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
+  revalidatePath(`/campaigns/${campaignId}/timeline`);
+  return undefined;
+}
+
+// Live reveal (M8 slice 3, docs/08-session-mode.md "Live reveal"), reachable
+// from the session screen. Broad reveal flips an entity's visibility
+// campaign-wide; private reveal grants one recipient (an actor entity or a
+// specific player) knowledge of it without changing campaign-wide visibility.
+// Both return a `success` message (unlike the entity-console knowledge panel's
+// list-refresh-only convention) since neither action has a persistent
+// confirmation surface of its own on this screen.
+export type RevealActionState =
+  | { error?: string; success?: string; timestamp?: number }
+  | undefined;
+
+export async function revealEntityBroadlyAction(
+  campaignId: string,
+  sessionId: string,
+  _prev: RevealActionState,
+  formData: FormData,
+): Promise<RevealActionState> {
+  const user = await requireUser();
+  const parsed = revealEntityBroadlySchema.safeParse({
+    entityId: formData.get("entityId"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input.", timestamp: Date.now() };
+  }
+
+  let alreadyVisible: boolean;
+  try {
+    const result = await revealEntityBroadly(user.id, campaignId, parsed.data.entityId);
+    alreadyVisible = result.alreadyVisible;
+  } catch (error) {
+    if (error instanceof ServiceError) return { error: error.message, timestamp: Date.now() };
+    logActionError("Reveal entity broadly action failed", error);
+    return { error: "Could not reveal this entity. Please try again.", timestamp: Date.now() };
+  }
+
+  revalidatePath(`/campaigns/${campaignId}`);
+  revalidatePath(`/campaigns/${campaignId}/entities/${parsed.data.entityId}`);
+  revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
+  return {
+    success: alreadyVisible ? "Already visible to all players." : "Revealed to all players.",
+    timestamp: Date.now(),
+  };
+}
+
+export async function revealSessionKnowledgeAction(
+  campaignId: string,
+  sessionId: string,
+  _prev: RevealActionState,
+  formData: FormData,
+): Promise<RevealActionState> {
+  const user = await requireUser();
+  const parsed = sessionRevealSchema.safeParse({
+    targetEntityId: formData.get("targetEntityId"),
+    recipientKind: formData.get("recipientKind"),
+    recipientEntityId: formData.get("recipientEntityId") || undefined,
+    membershipId: formData.get("membershipId") || undefined,
+    notes: formData.get("notes"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input.", timestamp: Date.now() };
+  }
+
+  try {
+    if (parsed.data.recipientKind === "ENTITY") {
+      await grantEntityKnowledge(user.id, campaignId, {
+        targetEntityId: parsed.data.targetEntityId,
+        recipientEntityId: parsed.data.recipientEntityId,
+        notes: parsed.data.notes,
+        sourceEventId: sessionId,
+      });
+    } else {
+      await grantMembershipKnowledge(user.id, campaignId, {
+        targetEntityId: parsed.data.targetEntityId,
+        membershipId: parsed.data.membershipId,
+        notes: parsed.data.notes,
+        sourceEventId: sessionId,
+      });
+    }
+  } catch (error) {
+    if (error instanceof ServiceError) return { error: error.message, timestamp: Date.now() };
+    logActionError("Reveal session knowledge action failed", error);
+    return { error: "Could not record the reveal. Please try again.", timestamp: Date.now() };
+  }
+
+  revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
+  revalidatePath(`/campaigns/${campaignId}/entities/${parsed.data.targetEntityId}`);
+  return { success: "Revealed.", timestamp: Date.now() };
+}
+
+export async function revokeSessionRevealAction(
+  campaignId: string,
+  sessionId: string,
+  grantId: string,
+): Promise<void> {
+  const user = await requireUser();
+  await revokeKnowledge(user.id, campaignId, grantId);
+  revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
+}
+
+// Session recap (M8 slice 4, docs/08-session-mode.md "Recaps & broadcasts").
+// Read-only synthesis over the session's own log + promoted events — never
+// writes canon (invariant #1) and is never persisted, so no revalidate (mirrors
+// askCampaignAction). Errors are safe messages (no key/raw provider text —
+// invariant #6).
+export type SessionRecapActionState =
+  | { recap?: string; model?: string; error?: string; timestamp?: number }
+  | undefined;
+
+export async function generateSessionRecapAction(
+  campaignId: string,
+  sessionId: string,
+  _prev: SessionRecapActionState,
+): Promise<SessionRecapActionState> {
+  void _prev;
+  const user = await requireUser();
+  try {
+    const result = await generateSessionRecap(user.id, campaignId, sessionId);
+    return { recap: result.recap, model: result.model, timestamp: Date.now() };
+  } catch (error) {
+    if (error instanceof ServiceError) return { error: error.message, timestamp: Date.now() };
+    logActionError("Generate session recap action failed", error);
+    return { error: "Could not generate a recap. Please try again.", timestamp: Date.now() };
+  }
+}
+
+// Publish a generated recap to players as a SYSTEM_MESSAGE (docs/08-session-mode.md
+// "Recaps & broadcasts"). Unlike generateSessionRecapAction this writes canon,
+// so it revalidates the session page (a fresh SYSTEM_MESSAGE now exists) and
+// returns the new entity's id so the panel can link to it.
+export type PublishSessionRecapActionState =
+  | { success?: string; entityId?: string; error?: string; timestamp?: number }
+  | undefined;
+
+export async function publishSessionRecapAction(
+  campaignId: string,
+  sessionId: string,
+  _prev: PublishSessionRecapActionState,
+  formData: FormData,
+): Promise<PublishSessionRecapActionState> {
+  const user = await requireUser();
+  const parsed = publishSessionRecapSchema.safeParse({
+    title: formData.get("title"),
+    recap: formData.get("recap"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input.", timestamp: Date.now() };
+  }
+
+  try {
+    const result = await publishSessionRecap(user.id, campaignId, sessionId, parsed.data);
+    revalidatePath(`/campaigns/${campaignId}/sessions/${sessionId}`);
+    return { success: "Published to players.", entityId: result.id, timestamp: Date.now() };
+  } catch (error) {
+    if (error instanceof ServiceError) return { error: error.message, timestamp: Date.now() };
+    logActionError("Publish session recap action failed", error);
+    return { error: "Could not publish the recap. Please try again.", timestamp: Date.now() };
+  }
 }
 
 export type EventActionState = { error?: string } | undefined;

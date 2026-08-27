@@ -107,22 +107,55 @@ the **System-message feed** (THE SYSTEM's in-fiction broadcasts, visibility-scop
 player logs in, sees only shared/own-crawler data, and can submit a suggestion.
 **Next up:** M8 — live session mode & recaps ([`08-session-mode.md`](./08-session-mode.md)).
 
-**Active: M8 — Live session mode & recaps**
+**M8 — Live session mode & recaps — done ✅ (2026-08-13)**
 ([08-session-mode.md](./08-session-mode.md)). Slice 1 — session capture — shipped
 ✅ 2026-08-04 (dated entry below): the `GameSession`/`SessionLogEntry` data model,
 a DM-only Sessions screen to start a session and jot a running freeform log
 during play, optionally tagged to existing entities via a typeahead picker.
-**Next up:** promoting a log entry to a canonical `Event` through the review
-pipeline, then live reveal (building on M3's `KnowledgeGrant` foundation) and
-recap generation.
+Slice 2 — promote to Event — shipped ✅ 2026-08-04 (dated entry below): each
+unpromoted log entry can be promoted to a canonical `Event` through the review
+pipeline (`source: DM`, auto-approved, fully provenanced), reusing the entry's
+own text as the Event summary and its live tagged entities as ACTOR
+participants. Slice 3 — live reveal — shipped ✅ 2026-08-04 (dated entry below):
+a "Live reveal" panel on the session screen lets the DM broadly reveal an
+entity (flip campaign-wide visibility to `PLAYER_VISIBLE`, through the review
+pipeline) or privately reveal it to one recipient — another actor entity, or
+now a specific player's `Membership` — creating a session-linked
+`KnowledgeGrant`, building on M3's fog-of-war foundation. Slice 4 — session
+recap generation — shipped ✅ 2026-08-13 (dated entry below): a one-button,
+ephemeral "previously on Dungeon Crawler World" recap synthesized from the
+session's raw log + the events it promoted, read-only like "Ask" (M5 slice 5)
+and never persisted. Slice 5 — publish recap — shipped ✅ 2026-08-13 (dated
+entry below): a "Publish to players" step on the recap panel turns the
+currently-shown recap into a `PLAYER_VISIBLE` `SYSTEM_MESSAGE`, created
+directly (an auto-approved DM `CREATE_ENTITY` change set, fully provenanced) —
+this closes the roadmap's M8 "done when" bar ("a DM can capture a session
+live, reveal facts to players, promote moments to Events, and publish
+recaps"). Per-crawler recap spotlights and an in-fiction/persona-voiced recap
+narration (the other two "Recaps & broadcasts" bullets) remain as non-blocking
+follow-ups — see "Open backlog" below. **Next up:** M9 — hardening, deploy &
+data portability.
 
 ### Scheduled roadmap additions (2026-06-19)
 
 These are accepted as roadmap/backlog design, not active implementation work;
-M6 remains the next milestone work. The detailed decisions live in
+M9 is now the next milestone work (M6–M8 are done, with M6's encounter
+generator and M11 actor-profile reuse as their own tracked backlog items). The
+detailed decisions live in
 [ADR 0012](./adr/0012-shared-canon-library-and-import.md) and
 [ADR 0013](./adr/0013-job-priorities-and-idle-maintenance.md).
 
+- [ ] **M8 (follow-up, non-blocking) — Per-crawler recap + in-fiction/persona-
+      voiced recap narration.** The two remaining bullets under
+      [`08-session-mode.md`](./08-session-mode.md)'s "Recaps & broadcasts":
+      (1) a spotlight recap scoped to what one player's crawler actually
+      experienced (visibility-respecting, for absent players/immersion), and
+      (2) rendering a recap in the active System AI persona's voice (or a
+      host's), reusing the M6 persona-prompt seam the way the dungeon-content
+      generator does. M8's roadmap "done when" bar (capture, reveal, promote,
+      publish) is already met by slices 1–5 — these are enhancements to the
+      existing `generateSessionRecap`/`publishSessionRecap` pair, not
+      blockers.
 - [ ] **M9/M10 — Global admin + shared canon library.** Add a global
       super-admin and guarded `/admin` shell; create a singleton admin-owned
       shared-library campaign. Permit read-only library browsing only through an
@@ -147,6 +180,398 @@ M6 remains the next milestone work. The detailed decisions live in
 
 (Open, non-milestone-blocking follow-ups and deferrals live in the subsections
 below.)
+
+## M8 — Publish session recap (slice 5) ✅ (2026-08-13)
+
+**Goal:** the fifth and final M8 slice — the "publish them to players … as a
+`SYSTEM_MESSAGE`/Show artifact via the review pipeline" half of
+[`08-session-mode.md`](./08-session-mode.md)'s "Recaps & broadcasts" note.
+Slice 4 shipped the ephemeral generate-only half; this slice adds the other
+option the doc calls out ("ephemeral … publish … or both"), and with it closes
+the roadmap's M8 "done when" bar: "a DM can capture a session live, reveal
+facts to players, promote moments to Events, and publish recaps."
+
+**Decision (publish the client-shown text verbatim, as a direct
+`PLAYER_VISIBLE` create — not a re-generation, not a DM_ONLY proposal to
+review further).** `generateSessionRecap` never persists its output (M8 slice
+4's deliberate ephemeral design), so publishing can't re-run the generator —
+it has nothing stored to re-run from — and re-generating would risk a
+different recap than the one the DM actually read and chose to publish. So
+`publishSessionRecap` takes the recap text straight from the client exactly as
+displayed (a hidden form field carries it from the already-rendered panel) and
+never touches the provider. This isn't a new privilege: a DM can already
+create any entity with any content through the ordinary create-entity form, so
+trusting DM-submitted text here is no different. Unlike the dungeon-content
+generator's `buildContentCreatePatch` (`DM_ONLY`, because that's an AI
+proposal a DM still reviews), publishing needs a new `buildBroadcastCreatePatch`
+(`entities.ts`) that creates `PLAYER_VISIBLE` immediately — clicking "Publish
+to players" *is* the deliberate reveal action, the same logic
+`revealEntityBroadly` already uses for an existing entity, just applied at
+creation time. The write itself reuses the ordinary auto-approved
+`CREATE_ENTITY` change-set path (`applyAutoApprovedEntityChangeSet`,
+`source: DM`), the same direct-write shape `promoteSessionLogEntryToEvent`
+already established for turning session-scratch content into canon, so the
+published message is fully provenanced. The UI (`PublishRecapForm`, a
+sub-component of `SessionRecapPanel`) mirrors `PromoteEntryForm`'s
+collapsed-button → title-field → static-confirmation-link shape; it's `key`d
+on the parent generate call's timestamp so clicking "Generate recap" again
+always resets it to collapsed, instead of showing a stale confirmation for a
+since-replaced recap.
+
+- [x] **Service** ([`entities.ts`](../src/server/services/entities.ts)):
+      `buildBroadcastCreatePatch(userId, campaignId, { type, name,
+      description, tags? })` — a `CREATE_ENTITY` patch builder like
+      `buildStubCreatePatch`/`buildContentCreatePatch`, but `PLAYER_VISIBLE`
+      instead of `DM_ONLY`.
+- [x] **Service** ([`sessions.ts`](../src/server/services/sessions.ts)):
+      `publishSessionRecap(userId, campaignId, sessionId, { title, recap })` —
+      DM-only, rejects a blank title/recap or an unknown session, files an
+      auto-approved DM `CREATE_ENTITY` change set for a `SYSTEM_MESSAGE`
+      (`PLAYER_VISIBLE`, `tags: ["recap"]`) via `buildBroadcastCreatePatch`.
+- [x] **Validation** ([`validation.ts`](../src/lib/validation.ts)):
+      `publishSessionRecapSchema` (`title` ≤200 chars, `recap` ≤4000 chars,
+      both required).
+- [x] **DM action** ([`(dm)/actions.ts`](<../src/app/(dm)/actions.ts>)):
+      `publishSessionRecapAction` — parses the form, calls the service,
+      revalidates the session page (unlike the read-only
+      `generateSessionRecapAction`, this one writes canon), returns the new
+      entity id so the panel can link to it.
+- [x] **UI** ([`session-recap-panel.tsx`](../src/components/sessions/session-recap-panel.tsx)):
+      a `PublishRecapForm` under the shown recap — a collapsed "Publish to
+      players" button expands to a headline field (prefilled
+      `Previously on Dungeon Crawler World: <session title>`, editable) with
+      the recap text carried as a hidden field; on success it swaps to a
+      static "Published to players · view message" link to the new entity's
+      World Browser detail page.
+- [x] **Tests:** DB-backed `publishSessionRecap` cases (creates a
+      CANON/`PLAYER_VISIBLE`/`source: DM` `SYSTEM_MESSAGE` with the given
+      title/recap and a `recap` tag; rejects a blank title, blank recap, an
+      unknown session, and a player caller) in
+      [`sessions.test.ts`](../tests/unit/sessions.test.ts); schema cases in
+      [`validation.test.ts`](../tests/unit/validation.test.ts); the action in
+      [`dm-actions.test.ts`](../tests/unit/dm-actions.test.ts) (publishes +
+      revalidates + returns the entity id, rejects invalid input without
+      calling the service, safe error + generic fallback); component coverage
+      in
+      [`session-recap-panel.test.tsx`](../tests/unit/session-recap-panel.test.tsx)
+      (collapsed affordance appears once a recap is shown, expands with the
+      recap carried as a hidden field, renders the confirmation link once the
+      action returns an entity id); updated
+      [`session-detail-page.test.tsx`](../tests/unit/session-detail-page.test.tsx)
+      for the new action mock.
+- [x] **Verification:** `npm run typecheck`, `npm run lint` (0 errors;
+      pre-existing settings-action warnings only), `npm run build` (routes
+      unchanged, no new route), and the full coverage gate green (159 files /
+      **2019 tests**; statements 95.42%, branches 88.77%, functions 96.52%,
+      lines 96.94%). **In-browser** (reseeded `dcc`, `dm@example.com`, a fresh
+      "Floor 9 Breach" session with one log entry): "Generate recap" hit the
+      same no-provider safe error slice 4 stopped at (no AI key configured in
+      this campaign), so the direct write path was verified instead —
+      calling `publishSessionRecap` for the session produced a
+      `CANON`/`PLAYER_VISIBLE`/`source: DM` `SYSTEM_MESSAGE` entity tagged
+      `recap`, confirmed both on its own World Browser detail page (visibility
+      toggle showing "player visible", `RECAP` tag, `DM` provenance origin)
+      and — scoped through a `player@example.com` membership added for the
+      check — in `getSystemMessageFeed`'s output, proving the publish path
+      lands somewhere a player's System-message feed actually reads from. No
+      console errors. The panel's own generate → publish click-through (title
+      prefill, hidden recap field, collapse-to-link) is covered by
+      `session-recap-panel.test.tsx`'s mocked-state tests, the same boundary
+      slice 4's AI-gated verification stopped at.
+
+## M8 — Session recap generation (slice 4) ✅ (2026-08-13)
+
+**Goal:** the fourth M8 slice — the "Session recap" bullet of
+[`08-session-mode.md`](./08-session-mode.md)'s "Recaps & broadcasts": "generate
+a 'previously on Dungeon Crawler World' summary from the session log + the
+events promoted that session." This is DCC-flavored narration over material
+the DM already captured, not new capability over canon.
+
+**Decision (ephemeral read-only synthesis, modeled directly on "Ask the
+Campaign" — not a change set, not persisted).** Docs/08 is explicit that
+"a DM can keep [recaps] ephemeral, publish them to players … or both," so this
+slice ships the ephemeral half only: `generateSessionRecap` never writes canon
+(invariant #1) and is never stored — the DM regenerates on demand, exactly
+like `askCampaign` (M5 slice 5). It takes no user text input (unlike "Ask"),
+so `generateSessionRecapAction`/`SessionRecapPanel` drop the question
+field/textarea entirely — a session detail page already knows its own
+`sessionId`, so the whole UI is a single "Generate recap" button. Context is
+built from two sources per the doc: the session's full raw log (chronological,
+with each entry's still-live tagged entity names) and the events that session
+promoted to canon (title + summary + `ACTOR` participant names, refetched live
+rather than trusted from the log so a since-edited or since-archived promoted
+event can't leak stale/removed text into the prompt). A new
+`src/server/ai/generators/session-recap.ts` (pure prompt-building, mirroring
+`ask-campaign.ts`) frames the system prompt in the show's "previously on…"
+promo voice while forbidding invented details; usage is recorded under
+generator id `session-recap` on the `AiUsage` table for cost tracking, the
+same non-canon usage-only trail "Ask" already established (no
+review-pipeline provenance, since there's no change set to attach it to).
+Persona voice (the doc's separate "In-fiction broadcast" bullet), a
+per-crawler spotlight recap, and publishing a recap as a player-facing
+`SYSTEM_MESSAGE` through the review pipeline are explicitly deferred to later
+M8 slices — each is its own vertical slice of new capability, unlike this
+one's synthesis-only scope.
+
+- [x] **Schema:** none — ephemeral, nothing persisted.
+- [x] **Generator** ([`session-recap.ts`](../src/server/ai/generators/session-recap.ts)):
+      `SESSION_RECAP_GENERATOR` id/version, `SESSION_RECAP_MAX_TOKENS` (768 —
+      a tight TV-recap read, not a full transcript), and pure
+      `buildSessionRecapPrompt` (cacheable framing + style guide; volatile
+      per-session log/promoted-events content).
+- [x] **Service** ([`sessions.ts`](../src/server/services/sessions.ts)):
+      `generateSessionRecap(userId, campaignId, sessionId)` — DM-only, loads
+      the session's entries (with tagged names resolved the same way
+      `getSession` does) and its live promoted `Event` rows, requires a
+      configured provider and available spend cap, calls `provider.generate`
+      (plain text, not structured — there's no proposal shape to validate
+      against), records usage best-effort, and returns the trimmed recap +
+      model. Rejects an empty session (no log entries at all), an unknown
+      session, a non-DM caller, no provider, a reached spend cap, a provider
+      failure (safe message — invariant #6), and an empty model response.
+- [x] **DM action** ([`(dm)/actions.ts`](<../src/app/(dm)/actions.ts>)):
+      `generateSessionRecapAction` — no form fields to parse; calls the
+      service and returns `{ recap, model }` or a safe error. No
+      `revalidatePath` (read-only, mirrors `askCampaignAction`).
+- [x] **UI** ([`session-recap-panel.tsx`](../src/components/sessions/session-recap-panel.tsx)):
+      a `SessionRecapPanel` — a single "Generate recap" button (no inputs),
+      an honest empty-state note before the first generation, the rendered
+      recap + model tag on success (styled like Ask's answer panel), and a
+      safe error message on failure. Rendered on the session detail page
+      between the log and the Live Reveal panel.
+- [x] **Tests:** DB-backed `generateSessionRecap` cases (generates from the raw
+      log and records an `AiUsage` row; folds in promoted-event titles/
+      participants alongside the raw log; rejects an empty session, an unknown
+      session, a player caller, no configured provider, an empty model
+      response; turns a provider failure into a safe `ServiceError` that never
+      echoes the raw error text) in
+      [`sessions.test.ts`](../tests/unit/sessions.test.ts) (provider mocked,
+      mirroring `ask.test.ts`); the action in
+      [`dm-actions.test.ts`](../tests/unit/dm-actions.test.ts) (passes through
+      the recap/model, no revalidate, safe error + generic fallback);
+      component coverage in
+      [`session-recap-panel.test.tsx`](../tests/unit/session-recap-panel.test.tsx)
+      (button + empty note, rendered recap + model, error state); updated
+      [`session-detail-page.test.tsx`](../tests/unit/session-detail-page.test.tsx)
+      for the new action mock and panel render.
+- [x] **Verification:** `npm run typecheck`, `npm run lint` (0 errors;
+      pre-existing settings-action warnings only), `npm run build` (no new
+      route — the existing `/campaigns/[id]/sessions/[sessionId]` route is
+      unchanged), and the full coverage gate green (159 files / **2006
+      tests**; statements 95.42%, branches 88.81%, functions 96.6%, lines
+      96.95%). **In-browser** (reseeded `dcc`, `dm@example.com`, a fresh
+      "Floor 9 Breach" session): with no AI key configured, clicking "Generate
+      recap" on a session with one log entry showed "Add an AI provider key in
+      Settings to generate a session recap." with no provider call; after
+      saving a placeholder Anthropic key in Settings, the same click showed
+      "The provider rejected the key (authentication failed)." — the same
+      safe-failure boundary the Ask/dungeon-content verifications stopped at,
+      confirming the button → action → service → provider → UI wiring end to
+      end with no raw key/provider text in the DOM (invariant #6). A second,
+      empty session showed "Add a log entry before generating a recap." on
+      click, with no provider call. No console errors throughout.
+
+## M8 — Live reveal (slice 3) ✅ (2026-08-04)
+
+**Goal:** the third M8 slice — let the DM **reveal** something at the table
+right now, per [`08-session-mode.md`](./08-session-mode.md)'s "Live reveal":
+"the DM can reveal an entity or fact either broadly or to specific
+recipients … a broad reveal updates the campaign-wide visibility … a private
+reveal creates `KnowledgeGrant` rows … without making the fact visible to
+everyone." This is the write-side half of M3's fog-of-war foundation
+(`KnowledgeGrant`, `Visibility`) finally getting a live-session entry point;
+the player-facing "known world" reader that consumes these grants stays
+tracked as open backlog (unchanged from before this slice — see "Knowledge /
+reveal grants" below).
+
+**Decision (a narrow visibility-flip function, not the full entity-edit form;
+`sourceEventId` doubles as the session link).** `updateEntity`'s patch-building
+diffs *every* core/kind field unconditionally — feeding it just a `visibility`
+value would silently wipe the other 10+ fields, since omitted form fields
+default to null/false rather than "leave alone." So broad reveal gets its own
+`revealEntityBroadly`, modeled directly on `archiveEntity`/`restoreEntity`: a
+two-key `ReviewPatch` (`_baseVersion` + `visibility`) through the existing
+`applyAutoApprovedEntityChangeSet` — the underlying `UPDATE_ENTITY` apply path
+was already a true partial patch (every field gated behind `"<field>" in
+patch"`), so this needed no change below `entities.ts`. It's a no-op (not an
+error) when the entity is already `PLAYER_VISIBLE`, so re-revealing is always
+safe. Private reveal reuses `KnowledgeGrant`'s already-designed-for-this
+`sourceEventId` column (the schema comment already called it "optional
+event/session context") to link a grant back to the `GameSession` it was made
+in — a plain string, not FK-checked, matching `targetId`/`recipientId`'s
+existing polymorphic pattern. `grantEntityKnowledge` gained an optional
+`sourceEventId` param (backward compatible); the new sibling
+`grantMembershipKnowledge` is the `MEMBERSHIP`-recipient counterpart the M3
+schema always supported but never had a writer for — kept as a separate
+function rather than widening `grantEntityKnowledge` further, since a
+membership recipient has a different existence check (a live `Role.PLAYER`
+membership, not a live-canon entity) and no natural counterpart-entity id for
+the existing ENTITY→ENTITY dedup/audit shape. `listSessionReveals` is a new
+DM-facing read projecting both recipient kinds for one session, dropping a
+grant whose target/entity-recipient is no longer live canon or whose
+membership was removed (same belt-and-suspenders precedent as
+`listKnowledgeOfEntity`).
+
+- [x] **Schema:** none — `KnowledgeRecipientType.MEMBERSHIP` and
+      `KnowledgeGrant.sourceEventId` already existed from M3; this slice is
+      the first writer/reader for both.
+- [x] **Service** ([`entities.ts`](../src/server/services/entities.ts)):
+      `revealEntityBroadly(userId, campaignId, entityId)` — DM-only, flips
+      `DM_ONLY → PLAYER_VISIBLE` through an audited auto-approved change set;
+      a no-op (`alreadyVisible: true`) when already player-visible; respects
+      field locks and staleness like any other `UPDATE_ENTITY` patch.
+- [x] **Service** ([`knowledge.ts`](../src/server/services/knowledge.ts)):
+      `grantEntityKnowledge` gained an optional `sourceEventId`;
+      `grantMembershipKnowledge(userId, campaignId, { targetEntityId,
+      membershipId, notes?, sourceEventId? })` — DM-only, the target must be
+      live canon and the membership a live `Role.PLAYER` in the campaign,
+      idempotent (identical active grant is a no-op), writes a `REVEAL`
+      `AuditLog` row; `listSessionReveals(userId, campaignId, sessionId)`
+      projects active `sourceEventId`-matched grants (both recipient kinds) to
+      `SessionRevealView[]`, DM-only (`[]` for a player/non-member).
+- [x] **Validation** ([`validation.ts`](../src/lib/validation.ts)):
+      `revealEntityBroadlySchema` (one `entityId` field) and
+      `sessionRevealSchema` — a `recipientKind`-discriminated union so an
+      `ENTITY` recipient requires `recipientEntityId` and a `MEMBERSHIP`
+      recipient requires `membershipId`, both sharing `targetEntityId` +
+      optional `notes`.
+- [x] **DM actions** ([`(dm)/actions.ts`](<../src/app/(dm)/actions.ts>)):
+      `revealEntityBroadlyAction`, `revealSessionKnowledgeAction` (dispatches
+      to `grantEntityKnowledge`/`grantMembershipKnowledge` by recipient kind,
+      stamping `sourceEventId: sessionId`), `revokeSessionRevealAction` — a new
+      `RevealActionState` (`{error?, success?, timestamp?}`) since neither
+      reveal action has its own persistent confirmation surface, unlike the
+      entity-console knowledge panel's list-refresh-only convention.
+- [x] **UI** ([`session-reveal-panel.tsx`](../src/components/sessions/session-reveal-panel.tsx)):
+      a `SessionRevealPanel` on the session detail screen — a broad-reveal
+      mini-form (entity typeahead + submit), a private-reveal mini-form
+      (target entity typeahead + a Player/Entity recipient-kind toggle +
+      either a player `<select>` sourced from `listPlayerMemberships` or a
+      recipient entity typeahead + notes), and a "Revealed this session"
+      history list (target → recipient, notes, a revoke button) reading
+      `listSessionReveals`. The recipient-kind toggle defaults to Player when
+      the campaign has players, else Entity.
+- [x] **Page** ([`sessions/[sessionId]/page.tsx`](<../src/app/(dm)/campaigns/[id]/sessions/[sessionId]/page.tsx>)):
+      fetches `listPlayerMemberships` + `listSessionReveals` alongside the
+      existing session/candidate fetches and renders `SessionRevealPanel`
+      below the log.
+- [x] **Tests:** DB-backed `revealEntityBroadly` cases (flips visibility with
+      provenance, no-op when already visible, blocked by a `visibility` lock,
+      denies a player, missing entity) in
+      [`entities.test.ts`](../tests/unit/entities.test.ts);
+      `grantMembershipKnowledge`/`listSessionReveals` cases (reveal + audit,
+      idempotent, blank ids, non-canon target, foreign/non-player membership,
+      player-caller denial, both recipient kinds newest-first, dropped
+      archived/removed counterparts, `[]` for player/non-member) in
+      [`knowledge.test.ts`](../tests/unit/knowledge.test.ts); schema cases in
+      [`validation.test.ts`](../tests/unit/validation.test.ts); the three new
+      actions in [`dm-actions.test.ts`](../tests/unit/dm-actions.test.ts);
+      component coverage in
+      [`session-reveal-panel.test.tsx`](../tests/unit/session-reveal-panel.test.tsx)
+      (both forms, history rendering incl. a MEMBERSHIP row, submit-button
+      gating, recipient-kind toggle, revoke); updated
+      [`session-detail-page.test.tsx`](../tests/unit/session-detail-page.test.tsx)
+      for the new fetches/panel.
+- [x] **Verification:** `npm run typecheck`, `npm run lint` (0 errors;
+      pre-existing settings-action warnings only), `npm run build` (routes
+      unchanged, no new route), and the full coverage gate green (158 files /
+      **1993 tests**; statements 95.43%, branches 88.84%, functions 96.58%,
+      lines 96.94%). **In-browser** (reseeded `dcc` + `seed-world.ts` + a
+      scratch script adding a `player@example.com` PLAYER membership to Demo
+      Campaign): started a session "Floor 9 Breach"; broadly revealing an
+      already-`PLAYER_VISIBLE` entity showed "Already visible to all
+      players." with no DB write, and broadly revealing the `DM_ONLY` "Skull
+      Empire" showed "Revealed to all players." and flipped its stored
+      `visibility` to `PLAYER_VISIBLE` (DB-confirmed); privately revealing
+      "The Grull Legion" to the player with a note showed "Revealed." and
+      added a "The Grull Legion → Test Player" row (with the note) under
+      "Revealed this session · 1"; clicking its revoke button dropped the
+      count back to 0 with the empty-state note. No console errors throughout.
+
+## M8 — Promote a log entry to a canonical Event (slice 2) ✅ (2026-08-04)
+
+**Goal:** the second M8 slice — let the DM turn a scratch session log entry into
+a canonical `Event`, per [`08-session-mode.md`](./08-session-mode.md): "the DM
+turns a log entry (or several) into a canonical Event … through the normal
+review pipeline — `source: DM`, auto-approved but fully provenanced." This is
+the bridge from slice 1's capture-only log to canon; causal links and effects
+stay a DM follow-up on the Timeline (unchanged from how event editing already
+works), not part of this slice.
+
+**Decision (title-only promote form; text → summary, tags → participants,
+server-side).** A full event-creation form (participants picker, time-anchor
+fields, effects rows) would fight the "capture fast, reconcile later"
+philosophy the whole session-log feature is built on. Instead
+`promoteSessionLogEntryToEvent` derives everything it can: the entry's own
+`text` becomes the Event's `summary` verbatim (no retyping), and its still-live
+tagged entities (already resolved once at log time) become `ACTOR`
+participants — a tag that's since gone non-canon is silently dropped, same
+policy as `getSession`'s own tag resolution. The DM supplies only a `title`
+(prefilled client-side from the entry's first line, editable before
+submitting). The created Event carries no in-game-time anchor
+(`UNSCHEDULED`) and no effects; the DM adds those afterward from the Timeline
+like any other event — reusing `createEvent`'s existing auto-approved DM
+change set means the promoted Event gets full provenance for free, and an
+entry's `promotedEventId` is a one-way pointer (rejects re-promoting).
+`SessionLogList` stays a Server Component; only the small per-entry promote
+affordance (`PromoteEntryForm`) is a client island, and it relies on the
+existing `revalidatePath`-driven refresh (same pattern as the log composer) to
+swap itself for a static "Promoted → view event" Timeline deep-link
+(`?event=<id>`, the same query param the Timeline already supports for
+causality-navigation deep-links) once the parent page's server data reflects
+the promotion — no local "just promoted" state to manage.
+
+- [x] **Validation** ([`validation.ts`](../src/lib/validation.ts)):
+      `promoteSessionLogEntrySchema` (title required, ≤200 chars — the only
+      field the form exposes).
+- [x] **Service** ([`sessions.ts`](../src/server/services/sessions.ts)):
+      `promoteSessionLogEntryToEvent(userId, campaignId, sessionId, entryId,
+      { title })` — DM-only, rejects an unknown entry or one already promoted,
+      filters tagged ids down to still-live-CANON entities before building
+      `ACTOR` participants, calls the existing `createEvent` (auto-approved DM
+      change set, `source: DM`), then stamps the entry's `promotedEventId`.
+- [x] **DM action** ([`(dm)/actions.ts`](<../src/app/(dm)/actions.ts>)):
+      `promoteSessionLogEntryAction` — validates, calls the service,
+      revalidates both the session page and the Timeline.
+- [x] **UI** ([`promote-entry-form.tsx`](../src/components/sessions/promote-entry-form.tsx),
+      [`session-log-list.tsx`](../src/components/sessions/session-log-list.tsx)):
+      a collapsed "Promote to event" button per unpromoted entry that expands
+      to a one-field title form (prefilled from the entry's first line, capped
+      at 80 chars for the default); a promoted entry instead renders a static
+      "Promoted → view event" link to `/campaigns/[id]/timeline?event=<id>`.
+- [x] **Tests:** DB-backed `promoteSessionLogEntryToEvent` cases in
+      [`sessions.test.ts`](../tests/unit/sessions.test.ts) (creates the Event
+      with the entry's text as summary + live tagged entities as ACTOR
+      participants; empty participants when untagged; drops a since-archived
+      tag; rejects a double-promote, an empty title, an unknown entry, and a
+      player caller); schema cases in
+      [`validation.test.ts`](../tests/unit/validation.test.ts); the action in
+      [`dm-actions.test.ts`](../tests/unit/dm-actions.test.ts); component
+      coverage in
+      [`promote-entry-form.test.tsx`](../tests/unit/promote-entry-form.test.tsx)
+      (collapsed → expanded, prefilled/edited title submission, returned-error
+      handling, cancel) and updated
+      [`session-log-list.test.tsx`](../tests/unit/session-log-list.test.tsx)
+      (promote affordance vs. promoted-link rendering); updated
+      [`session-detail-page.test.tsx`](../tests/unit/session-detail-page.test.tsx)
+      for the new action import.
+- [x] **Verification:** `npm run typecheck`, `npm run lint` (0 errors;
+      pre-existing settings-action warnings only), `npm run build` (routes
+      unchanged, no new route), and the full coverage gate green (157 files /
+      **1958 tests**; statements 95.44%, branches 88.94%, functions 96.53%,
+      lines 96.97%). **In-browser** (reseeded `dcc`, re-signed-in as
+      `dm@example.com` after the reseed to pick up a fresh JWT — the prior
+      session's user id had gone stale and briefly 500'd a campaign-create
+      attempt, per the known reseed-then-relogin gotcha; created a scratch
+      "Demo Campaign" NPC "Carl" and a session): logging "Carl insulted the
+      Maestro on air during the Floor 9 breach" tagged to Carl showed a
+      "Promote to event" button; clicking it expanded a title field prefilled
+      with the entry's full text (under 80 chars) which was edited to "Maestro
+      on-air incident" and submitted; the row flipped to "Promoted → view
+      event" (green) with no page reload; following the link landed on the
+      Timeline with the new Event highlighted — title "Maestro on-air
+      incident", the entry's text as its summary, a `DM` provenance badge, and
+      Carl listed as the sole `ACTOR` participant. No console errors.
 
 ## M8 — Live session capture (slice 1) ✅ (2026-08-04)
 
@@ -1397,10 +1822,14 @@ prompt. Branch: `codex/m6-persona-foundation`. Schema change.
       ships now; upload stays a later slice. The doc-09/doc-01 `imageUrl`/
       `attachments[]` sketches predate this; `attachments[]` (multi-image) is
       still unbuilt.
-- [ ] **Knowledge / reveal grants.** Extend beyond ENTITY→ENTITY to
-      field/relationship/event/FACT targets and MEMBERSHIP recipients; wire the
-      M7 player "known world" projection and M11 agent fog-of-war context; add a
-      reveal undo affordance and source-event linking for M8 session reveals.
+- [ ] **Knowledge / reveal grants.** M8 slice 3 (✅ 2026-08-04, dated entry
+      above) added `MEMBERSHIP` recipients, `sourceEventId` session linking, and
+      a revoke/undo affordance (all reachable from the session screen's Live
+      reveal panel) — still open: `ENTITY_FIELD`/`RELATIONSHIP`/`EVENT`/`FACT`
+      targets (today only `ENTITY` targets are written), and wiring these
+      grants into the M7 player "known world" projection and M11 agent
+      fog-of-war context (there is still no reader beyond the DM-facing
+      Knowledge panel and session history).
 - [ ] **Event effects ergonomics.** Design compensating change sets for
       undo/revert of already-applied effects. Deep-linking pending timeline
       effect badges to Review Queue proposals is complete.

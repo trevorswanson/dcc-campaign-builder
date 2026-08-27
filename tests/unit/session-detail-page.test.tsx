@@ -7,26 +7,53 @@ const {
   getCampaignForUser,
   getSession,
   listEntitiesForUser,
+  listPlayerMemberships,
+  listSessionReveals,
   notFound,
   addSessionLogEntryAction,
+  promoteSessionLogEntryAction,
+  generateSessionRecapAction,
+  publishSessionRecapAction,
   searchEntityCandidatesAction,
+  revealEntityBroadlyAction,
+  revealSessionKnowledgeAction,
+  revokeSessionRevealAction,
 } = vi.hoisted(() => ({
   requireUser: vi.fn(),
   getCampaignForUser: vi.fn(),
   getSession: vi.fn(),
   listEntitiesForUser: vi.fn(),
+  listPlayerMemberships: vi.fn(),
+  listSessionReveals: vi.fn(),
   notFound: vi.fn(() => {
     throw new Error("NEXT_NOT_FOUND");
   }),
   addSessionLogEntryAction: vi.fn(),
+  promoteSessionLogEntryAction: vi.fn(),
+  generateSessionRecapAction: vi.fn(),
+  publishSessionRecapAction: vi.fn(),
   searchEntityCandidatesAction: vi.fn(),
+  revealEntityBroadlyAction: vi.fn(),
+  revealSessionKnowledgeAction: vi.fn(),
+  revokeSessionRevealAction: vi.fn(),
 }));
 
 vi.mock("@/server/auth/session", () => ({ requireUser }));
 vi.mock("@/server/services/campaigns", () => ({ getCampaignForUser }));
 vi.mock("@/server/services/sessions", () => ({ getSession }));
 vi.mock("@/server/services/entities", () => ({ listEntitiesForUser }));
-vi.mock("@/app/(dm)/actions", () => ({ addSessionLogEntryAction, searchEntityCandidatesAction }));
+vi.mock("@/server/services/crawlers", () => ({ listPlayerMemberships }));
+vi.mock("@/server/services/knowledge", () => ({ listSessionReveals }));
+vi.mock("@/app/(dm)/actions", () => ({
+  addSessionLogEntryAction,
+  promoteSessionLogEntryAction,
+  generateSessionRecapAction,
+  publishSessionRecapAction,
+  searchEntityCandidatesAction,
+  revealEntityBroadlyAction,
+  revealSessionKnowledgeAction,
+  revokeSessionRevealAction,
+}));
 vi.mock("next/navigation", () => ({ notFound }));
 
 import CampaignSessionDetailPage from "@/app/(dm)/campaigns/[id]/sessions/[sessionId]/page";
@@ -44,6 +71,8 @@ beforeEach(() => {
     role: "OWNER",
     total: 1,
   });
+  listPlayerMemberships.mockResolvedValue([]);
+  listSessionReveals.mockResolvedValue([]);
   getSession.mockResolvedValue({
     id: "s1",
     title: "Session 12",
@@ -78,7 +107,11 @@ describe("CampaignSessionDetailPage", () => {
     expect(screen.getByText("Bring snacks")).toBeTruthy();
     expect(screen.getByLabelText("Log entry")).toBeTruthy();
     expect(screen.getByText("Donut insulted the Maestro")).toBeTruthy();
+    expect(screen.getByText(/Session recap/)).toBeTruthy();
+    expect(screen.getByText("Live reveal")).toBeTruthy();
     expect(getSession).toHaveBeenCalledWith("u1", "c1", "s1");
+    expect(listPlayerMemberships).toHaveBeenCalledWith("u1", "c1");
+    expect(listSessionReveals).toHaveBeenCalledWith("u1", "c1", "s1");
   });
 
   it("404s when the session doesn't exist in the campaign", async () => {

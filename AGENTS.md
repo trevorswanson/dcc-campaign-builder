@@ -14,7 +14,7 @@ pitch and [`docs/`](./docs) for the full plan.
 
 ## Current status
 
-🚧 **M0–M7 complete, M8 underway.** M6 slices 1–6 complete (its "done when" bar
+🚧 **M0–M8 complete, M9 next.** M6 slices 1–6 complete (its "done when" bar
 met; remaining slices blocked on M10/M11). M7 complete: game-progression
 (`GRANT_ACHIEVEMENT` event effect + the `BOX` `EntityType` with achievement→box
 `GRANTS_BOX` rewards and box→item `CONTAINS` contents) plus all six player
@@ -30,14 +30,40 @@ reusing the DM's role-scoped `askCampaign` service (slice 5); and player
 **Suggestions** at `/play/campaigns/[id]/suggestions` — a player proposes an
 edit to their own crawler's bio/notes, filed as a `PLAYER_SUGGESTION` change set
 through the existing review pipeline (slice 6), closing M7's "done when" bar.
-**M8 — live session mode & recaps 🚧.** Slice 1 added **session capture**: a
+**M8 — live session mode & recaps ✅.** Slice 1 added **session capture**: a
 DM-only `/campaigns/[id]/sessions` screen to start a play session and jot a
 running, timestamped, freeform log during the game — optionally tagged to
 existing entities via a typeahead picker — backed by a new `GameSession`/
 `SessionLogEntry` data model. Entries are scratch, not canon, created by a
-direct DM mutation (like `KnowledgeGrant`), never the review pipeline. **Next
-up:** promoting a log entry to a canonical Event, then live reveal and recap
-generation.
+direct DM mutation (like `KnowledgeGrant`), never the review pipeline. Slice 2
+added **promote to Event**: each unpromoted log entry gets an inline
+"Promote to event" affordance — the DM supplies only a title, and the entry's
+own text becomes the Event's summary while its still-live tagged entities
+become ACTOR participants, filed through `createEvent`'s existing
+auto-approved DM change set (`source: DM`, fully provenanced) so the low-
+friction capture flow stays low-friction on the way to canon. A promoted
+entry's `promotedEventId` swaps the button for a "Promoted → view event" deep
+link to the Timeline. Slice 3 added **live reveal**: a "Live reveal" panel on
+the session screen lets the DM broadly reveal an entity (flips visibility to
+`PLAYER_VISIBLE` through the review pipeline via a new `revealEntityBroadly`)
+or privately reveal it to one recipient — another actor entity, or now a
+specific player's `Membership` via a new `grantMembershipKnowledge` — creating
+a `KnowledgeGrant` linked back to the session (`sourceEventId`), building on
+M3's fog-of-war foundation; a "Revealed this session" history list supports
+revoke/undo. Slice 4 added **session recap generation**: a one-button,
+ephemeral "previously on Dungeon Crawler World" recap synthesized from the
+session's raw log plus the events it promoted that session — read-only like
+"Ask the Campaign" (never a change set, never persisted; the DM regenerates on
+demand). Slice 5 added **publish recap**: a "Publish to players" step on the
+recap panel turns the currently-shown recap text into a `PLAYER_VISIBLE`
+`SYSTEM_MESSAGE`, created directly via a new `buildBroadcastCreatePatch` +
+auto-approved DM `CREATE_ENTITY` change set (`source: DM`, fully provenanced,
+tagged `recap`) — the recap text is carried verbatim from the client rather
+than re-generated, since nothing about the ephemeral generate step is
+persisted server-side. This closes M8's "done when" bar (capture, reveal,
+promote, and now publish). Per-crawler recap spotlights and an in-fiction/
+persona-voiced recap narration remain open, non-blocking backlog (see
+`docs/PROGRESS.md`). **Next up:** M9 — hardening, deploy & data portability.
 M5.5 (data model hardening — ADR 0011) shipped all five slices: `data` versioning + `readKindData`
 seam, the `MIGRATE_ENTITY_DATA` job, reference-integrity badge + impact-aware
 archive, orphan report, the greenfield Faction satellite, and the Floor satellite

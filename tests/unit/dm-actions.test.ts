@@ -14,6 +14,7 @@ const {
   updateEntity,
   archiveEntity,
   restoreEntity,
+  revealEntityBroadly,
   approveChangeSet,
   approveChangeSetRun,
   rejectChangeSet,
@@ -41,9 +42,13 @@ const {
   applyEventEffects,
   cancelJob,
   grantEntityKnowledge,
+  grantMembershipKnowledge,
   revokeKnowledge,
   createSession,
   addSessionLogEntry,
+  promoteSessionLogEntryToEvent,
+  generateSessionRecap,
+  publishSessionRecap,
   fleshOutEntity,
   fleshOutEntities,
   inferRelationshipsForEntity,
@@ -77,6 +82,7 @@ const {
   updateEntity: vi.fn(),
   archiveEntity: vi.fn(),
   restoreEntity: vi.fn(),
+  revealEntityBroadly: vi.fn(),
   approveChangeSet: vi.fn(),
   approveChangeSetRun: vi.fn(),
   rejectChangeSet: vi.fn(),
@@ -104,9 +110,13 @@ const {
   applyEventEffects: vi.fn(),
   cancelJob: vi.fn(),
   grantEntityKnowledge: vi.fn(),
+  grantMembershipKnowledge: vi.fn(),
   revokeKnowledge: vi.fn(),
   createSession: vi.fn(),
   addSessionLogEntry: vi.fn(),
+  promoteSessionLogEntryToEvent: vi.fn(),
+  generateSessionRecap: vi.fn(),
+  publishSessionRecap: vi.fn(),
   fleshOutEntity: vi.fn(),
   fleshOutEntities: vi.fn(),
   inferRelationshipsForEntity: vi.fn(),
@@ -143,6 +153,7 @@ vi.mock("@/server/services/references", () => ({
 vi.mock("@/server/services/entities", () => ({
   archiveEntity,
   restoreEntity,
+  revealEntityBroadly,
   createCrawler,
   createGenericEntity,
   getEntityForUser,
@@ -181,11 +192,15 @@ vi.mock("@/server/services/events", () => ({
 }));
 vi.mock("@/server/services/knowledge", () => ({
   grantEntityKnowledge,
+  grantMembershipKnowledge,
   revokeKnowledge,
 }));
 vi.mock("@/server/services/sessions", () => ({
   createSession,
   addSessionLogEntry,
+  promoteSessionLogEntryToEvent,
+  generateSessionRecap,
+  publishSessionRecap,
 }));
 vi.mock("@/server/services/generation", () => ({
   fleshOutEntity,
@@ -269,6 +284,12 @@ import {
   revokeKnowledgeAction,
   createSessionAction,
   addSessionLogEntryAction,
+  promoteSessionLogEntryAction,
+  generateSessionRecapAction,
+  publishSessionRecapAction,
+  revealEntityBroadlyAction,
+  revealSessionKnowledgeAction,
+  revokeSessionRevealAction,
   fleshOutEntityAction,
   fleshOutEntitiesAction,
   enqueueBulkFleshAction,
@@ -2402,6 +2423,191 @@ describe("addSessionLogEntryAction", () => {
   });
 });
 
+describe("promoteSessionLogEntryAction", () => {
+  it("validates input before promoting", async () => {
+    const result = await promoteSessionLogEntryAction(
+      "c1",
+      "s1",
+      "e1",
+      undefined,
+      form({ title: "" }),
+    );
+    expect(result?.error).toBeTruthy();
+    expect(promoteSessionLogEntryToEvent).not.toHaveBeenCalled();
+  });
+
+  it("promotes the entry and revalidates the session + timeline pages", async () => {
+    promoteSessionLogEntryToEvent.mockResolvedValue({ id: "ev1" });
+
+    const result = await promoteSessionLogEntryAction(
+      "c1",
+      "s1",
+      "e1",
+      undefined,
+      form({ title: "Floor 9 Breach" }),
+    );
+
+    expect(result).toBeUndefined();
+    expect(promoteSessionLogEntryToEvent).toHaveBeenCalledWith("u1", "c1", "s1", "e1", {
+      title: "Floor 9 Breach",
+    });
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/sessions/s1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/timeline");
+  });
+
+  it("surfaces a ServiceError message and a generic fallback", async () => {
+    promoteSessionLogEntryToEvent.mockRejectedValueOnce(
+      new ServiceError("This entry has already been promoted to an event."),
+    );
+    expect(
+      (await promoteSessionLogEntryAction("c1", "s1", "e1", undefined, form({ title: "T" })))
+        ?.error,
+    ).toBe("This entry has already been promoted to an event.");
+
+    promoteSessionLogEntryToEvent.mockRejectedValueOnce(new Error("boom"));
+    expect(
+      (await promoteSessionLogEntryAction("c1", "s1", "e1", undefined, form({ title: "T" })))
+        ?.error,
+    ).toBe("Could not promote this entry. Please try again.");
+  });
+});
+
+describe("revealEntityBroadlyAction", () => {
+  it("validates input before revealing", async () => {
+    const result = await revealEntityBroadlyAction("c1", "s1", undefined, form({ entityId: "" }));
+    expect(result?.error).toBeTruthy();
+    expect(revealEntityBroadly).not.toHaveBeenCalled();
+  });
+
+  it("reveals the entity, revalidates the world/entity/session pages, and reports success", async () => {
+    revealEntityBroadly.mockResolvedValue({ id: "e1", alreadyVisible: false });
+
+    const result = await revealEntityBroadlyAction("c1", "s1", undefined, form({ entityId: "e1" }));
+
+    expect(revealEntityBroadly).toHaveBeenCalledWith("u1", "c1", "e1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/entities/e1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/sessions/s1");
+    expect(result?.success).toBe("Revealed to all players.");
+  });
+
+  it("reports the already-visible case distinctly", async () => {
+    revealEntityBroadly.mockResolvedValue({ id: "e1", alreadyVisible: true });
+
+    const result = await revealEntityBroadlyAction("c1", "s1", undefined, form({ entityId: "e1" }));
+
+    expect(result?.success).toBe("Already visible to all players.");
+  });
+
+  it("surfaces a ServiceError message and a generic fallback", async () => {
+    revealEntityBroadly.mockRejectedValueOnce(new ServiceError("locked"));
+    expect(
+      (await revealEntityBroadlyAction("c1", "s1", undefined, form({ entityId: "e1" })))?.error,
+    ).toBe("locked");
+
+    revealEntityBroadly.mockRejectedValueOnce(new Error("boom"));
+    expect(
+      (await revealEntityBroadlyAction("c1", "s1", undefined, form({ entityId: "e1" })))?.error,
+    ).toBe("Could not reveal this entity. Please try again.");
+  });
+});
+
+describe("revealSessionKnowledgeAction", () => {
+  it("validates input before recording (missing recipient id for the chosen kind)", async () => {
+    const result = await revealSessionKnowledgeAction(
+      "c1",
+      "s1",
+      undefined,
+      form({ targetEntityId: "t1", recipientKind: "ENTITY", recipientEntityId: "" }),
+    );
+    expect(result?.error).toBeTruthy();
+    expect(grantEntityKnowledge).not.toHaveBeenCalled();
+    expect(grantMembershipKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("grants an ENTITY recipient, tying the grant to this session", async () => {
+    grantEntityKnowledge.mockResolvedValue({ id: "k1", created: true, affectedEntityIds: [] });
+
+    const result = await revealSessionKnowledgeAction(
+      "c1",
+      "s1",
+      undefined,
+      form({
+        targetEntityId: "t1",
+        recipientKind: "ENTITY",
+        recipientEntityId: "npc1",
+        notes: "overheard",
+      }),
+    );
+
+    expect(grantEntityKnowledge).toHaveBeenCalledWith("u1", "c1", {
+      targetEntityId: "t1",
+      recipientEntityId: "npc1",
+      notes: "overheard",
+      sourceEventId: "s1",
+    });
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/sessions/s1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/entities/t1");
+    expect(result?.success).toBe("Revealed.");
+  });
+
+  it("grants a MEMBERSHIP recipient, tying the grant to this session", async () => {
+    grantMembershipKnowledge.mockResolvedValue({ id: "k1", created: true, targetEntityId: "t1" });
+
+    await revealSessionKnowledgeAction(
+      "c1",
+      "s1",
+      undefined,
+      form({ targetEntityId: "t1", recipientKind: "MEMBERSHIP", membershipId: "m1" }),
+    );
+
+    expect(grantMembershipKnowledge).toHaveBeenCalledWith("u1", "c1", {
+      targetEntityId: "t1",
+      membershipId: "m1",
+      notes: undefined,
+      sourceEventId: "s1",
+    });
+    expect(grantEntityKnowledge).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a ServiceError message and a generic fallback", async () => {
+    grantEntityKnowledge.mockRejectedValueOnce(new ServiceError("not live canon"));
+    expect(
+      (
+        await revealSessionKnowledgeAction(
+          "c1",
+          "s1",
+          undefined,
+          form({ targetEntityId: "t1", recipientKind: "ENTITY", recipientEntityId: "npc1" }),
+        )
+      )?.error,
+    ).toBe("not live canon");
+
+    grantEntityKnowledge.mockRejectedValueOnce(new Error("boom"));
+    expect(
+      (
+        await revealSessionKnowledgeAction(
+          "c1",
+          "s1",
+          undefined,
+          form({ targetEntityId: "t1", recipientKind: "ENTITY", recipientEntityId: "npc1" }),
+        )
+      )?.error,
+    ).toBe("Could not record the reveal. Please try again.");
+  });
+});
+
+describe("revokeSessionRevealAction", () => {
+  it("revokes the grant and revalidates the session page", async () => {
+    revokeKnowledge.mockResolvedValue({ id: "k1", affectedEntityIds: [] });
+
+    await revokeSessionRevealAction("c1", "s1", "k1");
+
+    expect(revokeKnowledge).toHaveBeenCalledWith("u1", "c1", "k1");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/sessions/s1");
+  });
+});
+
 describe("fleshOutEntityAction", () => {
   it("files a proposal and returns a success message + link, revalidating queue + entity", async () => {
     fleshOutEntity.mockResolvedValue({ changeSetId: "cs1", providerId: "anthropic", model: "claude-opus-4-8" });
@@ -2639,6 +2845,94 @@ describe("askCampaignAction", () => {
     expect((await askCampaignAction("c1", undefined, form({ question: "x" })))?.error).toBe(
       "The campaign couldn't answer that. Please try again.",
     );
+  });
+});
+
+describe("generateSessionRecapAction", () => {
+  it("returns the generated recap + model (no revalidate — read-only, never persisted)", async () => {
+    generateSessionRecap.mockResolvedValue({
+      recap: "Donut insulted the Maestro live on air.",
+      model: "claude-opus-4-8",
+      providerId: "anthropic",
+    });
+
+    const result = await generateSessionRecapAction("c1", "s1", undefined);
+
+    expect(generateSessionRecap).toHaveBeenCalledWith("u1", "c1", "s1");
+    expect(result?.recap).toBe("Donut insulted the Maestro live on air.");
+    expect(result?.model).toBe("claude-opus-4-8");
+    expect(result?.error).toBeUndefined();
+    expect(revalidatePath).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a ServiceError message and a generic fallback", async () => {
+    generateSessionRecap.mockRejectedValueOnce(new ServiceError("Add an AI provider key in Settings."));
+    expect((await generateSessionRecapAction("c1", "s1", undefined))?.error).toBe(
+      "Add an AI provider key in Settings.",
+    );
+
+    generateSessionRecap.mockRejectedValueOnce(new Error("boom"));
+    expect((await generateSessionRecapAction("c1", "s1", undefined))?.error).toBe(
+      "Could not generate a recap. Please try again.",
+    );
+  });
+});
+
+describe("publishSessionRecapAction", () => {
+  it("publishes the recap, revalidates the session page, and returns the entity id", async () => {
+    publishSessionRecap.mockResolvedValue({ id: "msg-1" });
+
+    const result = await publishSessionRecapAction(
+      "c1",
+      "s1",
+      undefined,
+      form({ title: "Previously on Dungeon Crawler World", recap: "Chaos ensued." }),
+    );
+
+    expect(publishSessionRecap).toHaveBeenCalledWith("u1", "c1", "s1", {
+      title: "Previously on Dungeon Crawler World",
+      recap: "Chaos ensued.",
+    });
+    expect(result?.entityId).toBe("msg-1");
+    expect(result?.success).toBe("Published to players.");
+    expect(revalidatePath).toHaveBeenCalledWith("/campaigns/c1/sessions/s1");
+  });
+
+  it("rejects invalid input without calling the service", async () => {
+    const result = await publishSessionRecapAction(
+      "c1",
+      "s1",
+      undefined,
+      form({ title: "", recap: "Chaos ensued." }),
+    );
+    expect(result?.error).toBe("Recap title is required.");
+    expect(publishSessionRecap).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a ServiceError message and a generic fallback", async () => {
+    publishSessionRecap.mockRejectedValueOnce(new ServiceError("Session not found."));
+    expect(
+      (
+        await publishSessionRecapAction(
+          "c1",
+          "s1",
+          undefined,
+          form({ title: "T", recap: "Text" }),
+        )
+      )?.error,
+    ).toBe("Session not found.");
+
+    publishSessionRecap.mockRejectedValueOnce(new Error("boom"));
+    expect(
+      (
+        await publishSessionRecapAction(
+          "c1",
+          "s1",
+          undefined,
+          form({ title: "T", recap: "Text" }),
+        )
+      )?.error,
+    ).toBe("Could not publish the recap. Please try again.");
   });
 });
 

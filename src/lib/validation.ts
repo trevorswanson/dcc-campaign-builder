@@ -510,6 +510,54 @@ export const addSessionLogEntrySchema = z.object({
 });
 export type AddSessionLogEntryInput = z.infer<typeof addSessionLogEntrySchema>;
 
+// Promoting a log entry to a canonical Event (docs/08-session-mode.md): the DM
+// supplies only a title — the event's summary is the entry's own text, and its
+// participants are the entry's tagged entities (still live canon), so the
+// low-friction promote stays a one-field form.
+export const promoteSessionLogEntrySchema = z.object({
+  title: z.string().trim().min(1, "Event title is required.").max(200),
+});
+export type PromoteSessionLogEntryInput = z.infer<typeof promoteSessionLogEntrySchema>;
+
+// Publishing a session recap to players (docs/08-session-mode.md "Recaps &
+// broadcasts"): the DM supplies a headline; `recap` is the already-generated
+// text carried from the client exactly as shown (never regenerated
+// server-side), capped generously above `SESSION_RECAP_MAX_TOKENS`' typical
+// output.
+export const publishSessionRecapSchema = z.object({
+  title: z.string().trim().min(1, "Recap title is required.").max(200),
+  recap: z.string().trim().min(1, "Recap text is required.").max(4000),
+});
+export type PublishSessionRecapInput = z.infer<typeof publishSessionRecapSchema>;
+
+// Live reveal, broad half (docs/08-session-mode.md "Live reveal"): flip an
+// entity's visibility campaign-wide. One field — the entity to reveal.
+export const revealEntityBroadlySchema = z.object({
+  entityId: z.string().trim().min(1, "Pick an entity."),
+});
+export type RevealEntityBroadlyInput = z.infer<typeof revealEntityBroadlySchema>;
+
+// Live reveal, private half: reveal one entity to a single recipient, who is
+// either another actor entity (NPC/party/…, like grantKnowledgeSchema) or a
+// specific player's Membership row — the two recipient kinds need different
+// id fields, so a discriminated union on `recipientKind` gives each branch its
+// own required id and narrows cleanly for the caller.
+export const sessionRevealSchema = z.discriminatedUnion("recipientKind", [
+  z.object({
+    targetEntityId: z.string().trim().min(1, "Pick what's being revealed."),
+    recipientKind: z.literal("ENTITY"),
+    recipientEntityId: z.string().trim().min(1, "Pick who learns this."),
+    notes: optionalText(500),
+  }),
+  z.object({
+    targetEntityId: z.string().trim().min(1, "Pick what's being revealed."),
+    recipientKind: z.literal("MEMBERSHIP"),
+    membershipId: z.string().trim().min(1, "Pick who learns this."),
+    notes: optionalText(500),
+  }),
+]);
+export type SessionRevealInput = z.infer<typeof sessionRevealSchema>;
+
 // Event participant roles (docs/01-domain-model.md). Any-to-any, like
 // relationship types — every role is valid for any entity.
 export const eventParticipantRoleValues = [
